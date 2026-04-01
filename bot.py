@@ -31,6 +31,7 @@ DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA busy_timeout = 5000")
 cursor = db.cursor()
 
 cursor.execute("""
@@ -95,11 +96,17 @@ db.commit()
 
 def add_user(user_id, username, first_name):
     cursor.execute(
-        "INSERT OR IGNORE INTO users (id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
+        """
+        INSERT INTO users (id, username, first_name, joined_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name
+        """,
         (user_id, username, first_name, time.time())
     )
     cursor.execute(
-        "INSERT OR IGNORE INTO messages (user_id, count) VALUES (?, 0)",
+        "INSERT OR IGNORE INTO messages (user_id, count, last_message_time) VALUES (?, 0, 0)",
         (user_id,)
     )
     db.commit()
@@ -900,19 +907,19 @@ async def forward_content(message: Message, target_id: int, caption: str = None)
         if message.text:
             return await bot.send_message(target_id, message.text, parse_mode=None)
         elif message.photo:
-            return await bot.send_photo(target_id, message.photo[-1].file_id, caption=caption)
+            return await bot.send_photo(target_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML")
         elif message.video:
-            return await bot.send_video(target_id, message.video.file_id, caption=caption)
+            return await bot.send_video(target_id, message.video.file_id, caption=caption, parse_mode="HTML")
         elif message.audio:
-            return await bot.send_audio(target_id, message.audio.file_id, caption=caption)
+            return await bot.send_audio(target_id, message.audio.file_id, caption=caption, parse_mode="HTML")
         elif message.document:
-            return await bot.send_document(target_id, message.document.file_id, caption=caption)
+            return await bot.send_document(target_id, message.document.file_id, caption=caption, parse_mode="HTML")
         elif message.voice:
-            return await bot.send_voice(target_id, message.voice.file_id)
+            return await bot.send_voice(target_id, message.voice.file_id, caption=caption, parse_mode="HTML")
         elif message.sticker:
             return await bot.send_sticker(target_id, message.sticker.file_id)
         elif message.animation:
-            return await bot.send_animation(target_id, message.animation.file_id, caption=caption)
+            return await bot.send_animation(target_id, message.animation.file_id, caption=caption, parse_mode="HTML")
         else:
             return await bot.copy_message(
                 chat_id=target_id,
@@ -995,9 +1002,13 @@ async def all_messages(message: Message):
 
     keyboard = user_action_keyboard(user.id)
 
+    media_caption = user_card
+    if message.caption:
+        media_caption += f"\n\n📝 {hd.quote(message.caption)}"
+
     for admin in ADMINS:
         try:
-            sent = await forward_content(message, admin, message.caption)
+            sent = await forward_content(message, admin, media_caption if not message.text else message.caption)
             if sent:
                 pub_data = encode_pub_data(sent.message_id, sent.chat.id)
                 pub_kb = InlineKeyboardMarkup(
@@ -1011,7 +1022,10 @@ async def all_messages(message: Message):
                     message_id=sent.message_id,
                     reply_markup=pub_kb
                 )
-            await bot.send_message(admin, user_card, reply_markup=keyboard, parse_mode="HTML")
+            if message.text:
+                await bot.send_message(admin, user_card, reply_markup=keyboard, parse_mode="HTML")
+            else:
+                await bot.send_message(admin, "Действия:", reply_markup=keyboard)
         except Exception as e:
             print(f"Ошибка отправки админу: {e}")
 
