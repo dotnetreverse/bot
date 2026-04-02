@@ -55,6 +55,7 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS daily_activity(
     date TEXT NOT NULL,
     user_id INTEGER NOT NULL,
+    message_count INTEGER DEFAULT 1,
     PRIMARY KEY (date, user_id)
 )
 """)
@@ -82,6 +83,7 @@ for migration in [
     "ALTER TABLE users ADD COLUMN joined_at REAL DEFAULT 0",
     "ALTER TABLE banned_users ADD COLUMN reason TEXT",
     "ALTER TABLE muted_users ADD COLUMN reason TEXT",
+    "ALTER TABLE daily_activity ADD COLUMN message_count INTEGER DEFAULT 1",
 ]:
     try:
         cursor.execute(migration)
@@ -116,7 +118,12 @@ def add_message(user_id):
     cursor.execute("UPDATE messages SET count = count + 1 WHERE user_id = ?", (user_id,))
     today = datetime.utcnow().strftime("%Y-%m-%d")
     cursor.execute(
-        "INSERT OR IGNORE INTO daily_activity (date, user_id) VALUES (?, ?)",
+        """
+        INSERT INTO daily_activity (date, user_id, message_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(date, user_id) DO UPDATE SET
+            message_count = COALESCE(message_count, 1) + 1
+        """,
         (today, user_id)
     )
     db.commit()
@@ -145,6 +152,18 @@ def get_activity_last_days(days: int = 7):
         d = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
         cursor.execute("SELECT COUNT(*) FROM daily_activity WHERE date = ?", (d,))
         result.append((d, cursor.fetchone()[0]))
+    return result
+
+def get_user_activity_last_days(user_id: int, days: int = 7):
+    result = []
+    for i in range(days - 1, -1, -1):
+        d = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+        cursor.execute(
+            "SELECT COALESCE(message_count, 1) FROM daily_activity WHERE date = ? AND user_id = ?",
+            (d, user_id)
+        )
+        row = cursor.fetchone()
+        result.append((d, row[0] if row else 0))
     return result
 
 
