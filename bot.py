@@ -916,6 +916,8 @@ async def forward_content(message: Message, target_id: int, caption: str = None)
             return await bot.send_document(target_id, message.document.file_id, caption=caption, parse_mode="HTML")
         elif message.voice:
             return await bot.send_voice(target_id, message.voice.file_id, caption=caption, parse_mode="HTML")
+        elif message.video_note:
+            return await bot.send_video_note(target_id, message.video_note.file_id)
         elif message.sticker:
             return await bot.send_sticker(target_id, message.sticker.file_id)
         elif message.animation:
@@ -1002,13 +1004,11 @@ async def all_messages(message: Message):
 
     keyboard = user_action_keyboard(user.id)
 
-    media_caption = user_card
-    if message.caption:
-        media_caption += f"\n\n📝 {hd.quote(message.caption)}"
+    content_caption = hd.quote(message.caption) if message.caption else None
 
     for admin in ADMINS:
         try:
-            sent = await forward_content(message, admin, media_caption if not message.text else message.caption)
+            sent = await forward_content(message, admin, content_caption)
             if sent:
                 pub_data = encode_pub_data(sent.message_id, sent.chat.id)
                 pub_kb = InlineKeyboardMarkup(
@@ -1022,10 +1022,7 @@ async def all_messages(message: Message):
                     message_id=sent.message_id,
                     reply_markup=pub_kb
                 )
-            if message.text:
-                await bot.send_message(admin, user_card, reply_markup=keyboard, parse_mode="HTML")
-            else:
-                await bot.send_message(admin, "Действия:", reply_markup=keyboard)
+            await bot.send_message(admin, user_card, reply_markup=keyboard, parse_mode="HTML")
         except Exception as e:
             print(f"Ошибка отправки админу: {e}")
 
