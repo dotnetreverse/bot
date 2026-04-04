@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS muted_users(
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS publication_map(
+    admin_chat_id INTEGER NOT NULL,
+    admin_message_id INTEGER NOT NULL,
+    source_chat_id INTEGER NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    published INTEGER DEFAULT 0,
+    PRIMARY KEY (admin_chat_id, admin_message_id)
+)
+""")
+
 # Миграции для старых БД
 for migration in [
     "ALTER TABLE users ADD COLUMN joined_at REAL DEFAULT 0",
@@ -125,6 +136,57 @@ def add_message(user_id):
             message_count = COALESCE(message_count, 1) + 1
         """,
         (today, user_id)
+    )
+    db.commit()
+
+
+def save_publication_copy(admin_chat_id: int, admin_message_id: int, source_chat_id: int, source_message_id: int):
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO publication_map (
+            admin_chat_id, admin_message_id, source_chat_id, source_message_id, published
+        ) VALUES (?, ?, ?, ?, COALESCE((
+            SELECT published FROM publication_map
+            WHERE admin_chat_id = ? AND admin_message_id = ?
+        ), 0))
+        """,
+        (admin_chat_id, admin_message_id, source_chat_id, source_message_id, admin_chat_id, admin_message_id)
+    )
+    db.commit()
+
+
+def get_publication_entry(admin_chat_id: int, admin_message_id: int):
+    cursor.execute(
+        """
+        SELECT source_chat_id, source_message_id, published
+        FROM publication_map
+        WHERE admin_chat_id = ? AND admin_message_id = ?
+        """,
+        (admin_chat_id, admin_message_id)
+    )
+    return cursor.fetchone()
+
+
+def get_publication_copies(source_chat_id: int, source_message_id: int):
+    cursor.execute(
+        """
+        SELECT admin_chat_id, admin_message_id, published
+        FROM publication_map
+        WHERE source_chat_id = ? AND source_message_id = ?
+        """,
+        (source_chat_id, source_message_id)
+    )
+    return cursor.fetchall()
+
+
+def mark_publication_done(source_chat_id: int, source_message_id: int):
+    cursor.execute(
+        """
+        UPDATE publication_map
+        SET published = 1
+        WHERE source_chat_id = ? AND source_message_id = ?
+        """,
+        (source_chat_id, source_message_id)
     )
     db.commit()
 
@@ -411,9 +473,8 @@ async def _do_ban(user_id: int, reason, reply_to: Message):
     row = cursor.fetchone()
     username = row[0] if row else None
     ban_user(user_id, username, reason)
-    label = get_user_display(user_id, username)
     r_text = f"\nПричина: {hd.quote(reason)}" if reason else ""
-    await reply_to.answer(f"🚫 {label} забанен.{r_text}", parse_mode="HTML")
+    await reply_to.answer(f"🚫 Пользователь забанен.{r_text}", parse_mode="HTML")
     try:
         notify = "🚫 Вы были <b>забанены</b>."
         if reason:
@@ -431,9 +492,8 @@ async def _do_mute(user_id: int, seconds: int, reason, reply_to: Message):
     actual_seconds = FOREVER_SECONDS if forever else seconds
     mute_user(user_id, username, actual_seconds, reason)
     label_time = "навсегда" if forever else format_duration(seconds)
-    label = get_user_display(user_id, username)
     r_text = f"\nПричина: {hd.quote(reason)}" if reason else ""
-    await reply_to.answer(f"🔇 {label} замучен на {label_time}.{r_text}", parse_mode="HTML")
+    await reply_to.answer(f"🔇 Пользователь замучен на {label_time}.{r_text}", parse_mode="HTML")
     try:
         notify = f"🔇 Вы были <b>замучены</b> на <b>{label_time}</b>."
         if reason:
@@ -592,10 +652,56 @@ async def publish_confirm(callback: types.CallbackQuery):
         return
     raw = callback.data[len("pubconfirm:"):]
     msg_id, chat_id = decode_pub_data(raw)
+
+    entry = get_publication_entry(chat_id, msg_id)
+    if entry:
+        source_chat_id, source_message_id, published = entry
+    else:
+        source_chat_id, source_message_id, published = chat_id, msg_id, 0
+
+    if published:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.answer("Уже опубликовано", show_alert=True)
+        return
+
     try:
-        await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=chat_id, message_id=msg_id)
+        await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=source_chat_id, message_id=source_message_id)
+        mark_publication_done(source_chat_id, source_message_id)
+
+        copies = get_publication_copies(source_chat_id, source_message_id)
+        if copies:
+            for admin_chat_id, admin_message_id, _ in copies:
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=admin_chat_id,
+                        message_id=admin_message_id,
+                        reply_markup=None
+                    )
+                except Exception:
+                    pass
+                try:
+                    await bot.send_message(
+                        admin_chat_id,
+                        "✅ Опубликовано",
+                        reply_to_message_id=admin_message_id
+                    )
+                except Exception:
+                    pass
+        else:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "✅ Опубликовано",
+                    reply_to_message_id=msg_id
+                )
+            except Exception:
+                pass
+
         await callback.answer("✅ Опубликовано в канал!", show_alert=True)
-        await callback.message.edit_reply_markup(reply_markup=None)
     except Exception as e:
         await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
 
@@ -1029,6 +1135,12 @@ async def all_messages(message: Message):
         try:
             sent = await forward_content(message, admin, content_caption)
             if sent:
+                save_publication_copy(
+                    admin_chat_id=admin,
+                    admin_message_id=sent.message_id,
+                    source_chat_id=message.chat.id,
+                    source_message_id=message.message_id,
+                )
                 pub_data = encode_pub_data(sent.message_id, sent.chat.id)
                 pub_kb = InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(
