@@ -85,7 +85,21 @@ CREATE TABLE IF NOT EXISTS publication_map(
     source_chat_id INTEGER NOT NULL,
     source_message_id INTEGER NOT NULL,
     published INTEGER DEFAULT 0,
+    channel_message_id INTEGER,
+    deleted INTEGER DEFAULT 0,
+    content_text TEXT,
+    content_caption TEXT,
     PRIMARY KEY (admin_chat_id, admin_message_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS publication_status_map(
+    admin_chat_id INTEGER NOT NULL,
+    status_message_id INTEGER NOT NULL,
+    source_chat_id INTEGER NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    PRIMARY KEY (admin_chat_id, status_message_id)
 )
 """)
 
@@ -95,6 +109,10 @@ for migration in [
     "ALTER TABLE banned_users ADD COLUMN reason TEXT",
     "ALTER TABLE muted_users ADD COLUMN reason TEXT",
     "ALTER TABLE daily_activity ADD COLUMN message_count INTEGER DEFAULT 1",
+    "ALTER TABLE publication_map ADD COLUMN channel_message_id INTEGER",
+    "ALTER TABLE publication_map ADD COLUMN deleted INTEGER DEFAULT 0",
+    "ALTER TABLE publication_map ADD COLUMN content_text TEXT",
+    "ALTER TABLE publication_map ADD COLUMN content_caption TEXT",
 ]:
     try:
         cursor.execute(migration)
@@ -140,17 +158,56 @@ def add_message(user_id):
     db.commit()
 
 
-def save_publication_copy(admin_chat_id: int, admin_message_id: int, source_chat_id: int, source_message_id: int):
+def save_publication_copy(
+    admin_chat_id: int,
+    admin_message_id: int,
+    source_chat_id: int,
+    source_message_id: int,
+    content_text: str | None = None,
+    content_caption: str | None = None,
+):
+    existing = get_publication_entry(admin_chat_id, admin_message_id)
+    published = existing[2] if existing else 0
+    channel_message_id = existing[3] if existing else None
+    deleted = existing[4] if existing else 0
+
     cursor.execute(
         """
         INSERT OR REPLACE INTO publication_map (
-            admin_chat_id, admin_message_id, source_chat_id, source_message_id, published
-        ) VALUES (?, ?, ?, ?, COALESCE((
-            SELECT published FROM publication_map
-            WHERE admin_chat_id = ? AND admin_message_id = ?
-        ), 0))
+            admin_chat_id,
+            admin_message_id,
+            source_chat_id,
+            source_message_id,
+            published,
+            channel_message_id,
+            deleted,
+            content_text,
+            content_caption
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (admin_chat_id, admin_message_id, source_chat_id, source_message_id, admin_chat_id, admin_message_id)
+        (
+            admin_chat_id,
+            admin_message_id,
+            source_chat_id,
+            source_message_id,
+            published,
+            channel_message_id,
+            deleted,
+            content_text,
+            content_caption,
+        )
+    )
+    db.commit()
+
+
+def save_publication_status(admin_chat_id: int, status_message_id: int, source_chat_id: int, source_message_id: int):
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO publication_status_map (
+            admin_chat_id, status_message_id, source_chat_id, source_message_id
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (admin_chat_id, status_message_id, source_chat_id, source_message_id)
     )
     db.commit()
 
@@ -158,7 +215,7 @@ def save_publication_copy(admin_chat_id: int, admin_message_id: int, source_chat
 def get_publication_entry(admin_chat_id: int, admin_message_id: int):
     cursor.execute(
         """
-        SELECT source_chat_id, source_message_id, published
+        SELECT source_chat_id, source_message_id, published, channel_message_id, deleted, content_text, content_caption
         FROM publication_map
         WHERE admin_chat_id = ? AND admin_message_id = ?
         """,
@@ -170,7 +227,7 @@ def get_publication_entry(admin_chat_id: int, admin_message_id: int):
 def get_publication_copies(source_chat_id: int, source_message_id: int):
     cursor.execute(
         """
-        SELECT admin_chat_id, admin_message_id, published
+        SELECT admin_chat_id, admin_message_id, published, channel_message_id, deleted, content_text, content_caption
         FROM publication_map
         WHERE source_chat_id = ? AND source_message_id = ?
         """,
@@ -179,16 +236,54 @@ def get_publication_copies(source_chat_id: int, source_message_id: int):
     return cursor.fetchall()
 
 
-def mark_publication_done(source_chat_id: int, source_message_id: int):
+def get_publication_statuses(source_chat_id: int, source_message_id: int):
+    cursor.execute(
+        """
+        SELECT admin_chat_id, status_message_id
+        FROM publication_status_map
+        WHERE source_chat_id = ? AND source_message_id = ?
+        """,
+        (source_chat_id, source_message_id)
+    )
+    return cursor.fetchall()
+
+
+def mark_publication_done(source_chat_id: int, source_message_id: int, channel_message_id: int):
     cursor.execute(
         """
         UPDATE publication_map
-        SET published = 1
+        SET published = 1, channel_message_id = ?, deleted = 0
+        WHERE source_chat_id = ? AND source_message_id = ?
+        """,
+        (channel_message_id, source_chat_id, source_message_id)
+    )
+    db.commit()
+
+
+def mark_publication_deleted(source_chat_id: int, source_message_id: int):
+    cursor.execute(
+        """
+        UPDATE publication_map
+        SET deleted = 1
         WHERE source_chat_id = ? AND source_message_id = ?
         """,
         (source_chat_id, source_message_id)
     )
     db.commit()
+
+
+def get_channel_message_id(source_chat_id: int, source_message_id: int):
+    cursor.execute(
+        """
+        SELECT channel_message_id
+        FROM publication_map
+        WHERE source_chat_id = ? AND source_message_id = ? AND channel_message_id IS NOT NULL
+        LIMIT 1
+        """,
+        (source_chat_id, source_message_id)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
 
 
 def get_stats():
@@ -394,6 +489,123 @@ def decode_pub_data(s: str):
     return int(msg_id_str), int(chat_id_str)
 
 
+def strip_publication_status(text: str | None) -> str | None:
+    if text is None:
+        return None
+    for suffix in ("\n\n✅ Опубликовано", "\n\n🗑 Удалено из канала"):
+        if text.endswith(suffix):
+            return text[:-len(suffix)]
+    return text
+
+
+async def mirror_admin_reply_to_other_admins(message: Message, target_user_id: int):
+    admin_name = hd.quote(message.from_user.first_name or "Админ")
+    info_text = f"↩️ <b>Ответ пользователю</b>\nАдмин: {admin_name}"
+
+    for admin_id in ADMINS:
+        if admin_id == message.from_user.id:
+            continue
+        try:
+            if message.text:
+                await bot.send_message(admin_id, f"{info_text}\n\n{hd.quote(message.text)}", parse_mode="HTML")
+            elif message.photo:
+                caption = info_text + (f"\n\n{hd.quote(message.caption)}" if message.caption else "")
+                await bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML")
+            elif message.video:
+                caption = info_text + (f"\n\n{hd.quote(message.caption)}" if message.caption else "")
+                await bot.send_video(admin_id, message.video.file_id, caption=caption, parse_mode="HTML")
+            elif message.audio:
+                caption = info_text + (f"\n\n{hd.quote(message.caption)}" if message.caption else "")
+                await bot.send_audio(admin_id, message.audio.file_id, caption=caption, parse_mode="HTML")
+            elif message.document:
+                caption = info_text + (f"\n\n{hd.quote(message.caption)}" if message.caption else "")
+                await bot.send_document(admin_id, message.document.file_id, caption=caption, parse_mode="HTML")
+            elif message.voice:
+                caption = info_text + (f"\n\n{hd.quote(message.caption)}" if message.caption else "")
+                await bot.send_voice(admin_id, message.voice.file_id, caption=caption, parse_mode="HTML")
+            elif message.video_note:
+                sent = await bot.send_video_note(admin_id, message.video_note.file_id)
+                await bot.send_message(admin_id, info_text, parse_mode="HTML", reply_to_message_id=sent.message_id)
+            elif message.sticker:
+                sent = await bot.send_sticker(admin_id, message.sticker.file_id)
+                await bot.send_message(admin_id, info_text, parse_mode="HTML", reply_to_message_id=sent.message_id)
+            elif message.animation:
+                caption = info_text + (f"\n\n{hd.quote(message.caption)}" if message.caption else "")
+                await bot.send_animation(admin_id, message.animation.file_id, caption=caption, parse_mode="HTML")
+            elif message.poll:
+                sent = await bot.send_poll(
+                    admin_id,
+                    question=message.poll.question,
+                    options=[option.text for option in message.poll.options],
+                    is_anonymous=message.poll.is_anonymous,
+                    type=message.poll.type,
+                    allows_multiple_answers=message.poll.allows_multiple_answers,
+                    correct_option_id=message.poll.correct_option_id,
+                    explanation=message.poll.explanation,
+                    open_period=message.poll.open_period,
+                    close_date=message.poll.close_date,
+                    is_closed=message.poll.is_closed,
+                )
+                await bot.send_message(admin_id, info_text, parse_mode="HTML", reply_to_message_id=sent.message_id)
+            else:
+                sent = await bot.copy_message(chat_id=admin_id, from_chat_id=message.chat.id, message_id=message.message_id)
+                await bot.send_message(admin_id, info_text, parse_mode="HTML", reply_to_message_id=sent.message_id)
+        except Exception as e:
+            print(f"Ошибка mirror_admin_reply_to_other_admins: {e}")
+
+
+def build_status_keyboard(source_chat_id: int, source_message_id: int, status_text: str = None, allow_delete: bool = False, show_status_button: bool = False) -> InlineKeyboardMarkup | None:
+    rows = []
+    if show_status_button and status_text:
+        rows.append([InlineKeyboardButton(text=status_text, callback_data="noop")])
+    if allow_delete:
+        data = encode_pub_data(source_message_id, source_chat_id)
+        rows.append([InlineKeyboardButton(text="🗑 Удалить из канала", callback_data=f"delpost:{data}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def sync_admin_post_state(source_chat_id: int, source_message_id: int, status_text: str, allow_delete: bool):
+    copies = get_publication_copies(source_chat_id, source_message_id)
+    for admin_chat_id, admin_message_id, _, _, _, _, _ in copies:
+        entry = get_publication_entry(admin_chat_id, admin_message_id)
+        if not entry:
+            continue
+        _, _, _, _, _, content_text, content_caption = entry
+        try:
+            if content_text is not None:
+                base_text = strip_publication_status(content_text) or ""
+                new_text = f"{base_text}\n\n{status_text}" if base_text else status_text
+                await bot.edit_message_text(
+                    chat_id=admin_chat_id,
+                    message_id=admin_message_id,
+                    text=new_text,
+                    reply_markup=build_status_keyboard(source_chat_id, source_message_id, allow_delete=allow_delete),
+                    parse_mode=None,
+                )
+            elif content_caption is not None:
+                base_caption = strip_publication_status(content_caption) or ""
+                new_caption = f"{base_caption}\n\n{status_text}" if base_caption else status_text
+                await bot.edit_message_caption(
+                    chat_id=admin_chat_id,
+                    message_id=admin_message_id,
+                    caption=new_caption,
+                    reply_markup=build_status_keyboard(source_chat_id, source_message_id, allow_delete=allow_delete),
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.edit_message_reply_markup(
+                    chat_id=admin_chat_id,
+                    message_id=admin_message_id,
+                    reply_markup=build_status_keyboard(
+                        source_chat_id,
+                        source_message_id,
+                        status_text=status_text,
+                        allow_delete=allow_delete,
+                        show_status_button=True,
+                    )
+                )
+        except Exception as e:
+            print(f"Ошибка sync_admin_post_state: {e}")
 # ================= KEYBOARDS =================
 
 def mute_time_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -422,6 +634,15 @@ def publish_confirm_keyboard(msg_id: int, chat_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[[
             InlineKeyboardButton(text="✅ Да, опубликовать", callback_data=f"pubconfirm:{data}"),
             InlineKeyboardButton(text="❌ Отмена",           callback_data=f"pubcancel:{data}"),
+        ]]
+    )
+
+
+def published_status_keyboard(source_chat_id: int, source_message_id: int) -> InlineKeyboardMarkup:
+    data = encode_pub_data(source_message_id, source_chat_id)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Удалить из канала", callback_data=f"delpost:{data}")
         ]]
     )
 
@@ -525,6 +746,11 @@ async def reply_cancel(callback: types.CallbackQuery):
         return
     reply_mode.pop(callback.from_user.id, None)
     await callback.message.edit_text("↩️ Ответ отменён.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
@@ -652,55 +878,20 @@ async def publish_confirm(callback: types.CallbackQuery):
         return
     raw = callback.data[len("pubconfirm:"):]
     msg_id, chat_id = decode_pub_data(raw)
-
     entry = get_publication_entry(chat_id, msg_id)
+    source_chat_id = chat_id
+    source_message_id = msg_id
     if entry:
-        source_chat_id, source_message_id, published = entry
-    else:
-        source_chat_id, source_message_id, published = chat_id, msg_id, 0
-
-    if published:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await callback.answer("Уже опубликовано", show_alert=True)
-        return
+        source_chat_id, source_message_id, published, channel_message_id, deleted, _, _ = entry
+        if published and channel_message_id and not deleted:
+            await sync_admin_post_state(source_chat_id, source_message_id, "✅ Опубликовано", allow_delete=True)
+            await callback.answer("Уже опубликовано", show_alert=True)
+            return
 
     try:
-        await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=source_chat_id, message_id=source_message_id)
-        mark_publication_done(source_chat_id, source_message_id)
-
-        copies = get_publication_copies(source_chat_id, source_message_id)
-        if copies:
-            for admin_chat_id, admin_message_id, _ in copies:
-                try:
-                    await bot.edit_message_reply_markup(
-                        chat_id=admin_chat_id,
-                        message_id=admin_message_id,
-                        reply_markup=None
-                    )
-                except Exception:
-                    pass
-                try:
-                    await bot.send_message(
-                        admin_chat_id,
-                        "✅ Опубликовано",
-                        reply_to_message_id=admin_message_id
-                    )
-                except Exception:
-                    pass
-        else:
-            await callback.message.edit_reply_markup(reply_markup=None)
-            try:
-                await bot.send_message(
-                    chat_id,
-                    "✅ Опубликовано",
-                    reply_to_message_id=msg_id
-                )
-            except Exception:
-                pass
-
+        sent_to_channel = await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=chat_id, message_id=msg_id)
+        mark_publication_done(source_chat_id, source_message_id, sent_to_channel.message_id)
+        await sync_admin_post_state(source_chat_id, source_message_id, "✅ Опубликовано", allow_delete=True)
         await callback.answer("✅ Опубликовано в канал!", show_alert=True)
     except Exception as e:
         await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
@@ -720,6 +911,45 @@ async def publish_cancel(callback: types.CallbackQuery):
     )
     await callback.message.edit_reply_markup(reply_markup=pub_kb)
     await callback.answer("Отменено")
+
+
+@dp.callback_query(F.data.startswith("delpost:"))
+async def delete_channel_post(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    raw = callback.data[len("delpost:"):]
+    source_message_id, source_chat_id = decode_pub_data(raw)
+
+    copies = get_publication_copies(source_chat_id, source_message_id)
+    if not copies:
+        await callback.answer("Пост не найден", show_alert=True)
+        return
+
+    published = any(row[2] for row in copies)
+    deleted = any(row[4] for row in copies)
+    channel_message_id = get_channel_message_id(source_chat_id, source_message_id)
+
+    if not published or not channel_message_id:
+        await callback.answer("Пост ещё не опубликован", show_alert=True)
+        return
+
+    if deleted:
+        await sync_admin_post_state(source_chat_id, source_message_id, "🗑 Удалено из канала", allow_delete=False)
+        await callback.answer("Уже удалено", show_alert=True)
+        return
+
+    try:
+        await bot.delete_message(chat_id=CHANNEL_ID, message_id=channel_message_id)
+    except Exception as e:
+        err = str(e).lower()
+        if "message to delete not found" not in err and "message can't be deleted" not in err and "message cant be deleted" not in err:
+            await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
+            return
+
+    mark_publication_deleted(source_chat_id, source_message_id)
+    await sync_admin_post_state(source_chat_id, source_message_id, "🗑 Удалено из канала", allow_delete=False)
+    await callback.answer("🗑 Пост удалён", show_alert=True)
 
 
 # ================= ADMIN PANEL =================
@@ -1043,6 +1273,20 @@ async def forward_content(message: Message, target_id: int, caption: str = None)
             return await bot.send_voice(target_id, message.voice.file_id, caption=caption, parse_mode="HTML")
         elif message.video_note:
             return await bot.send_video_note(target_id, message.video_note.file_id)
+        elif message.poll:
+            return await bot.send_poll(
+                target_id,
+                question=message.poll.question,
+                options=[option.text for option in message.poll.options],
+                is_anonymous=message.poll.is_anonymous,
+                type=message.poll.type,
+                allows_multiple_answers=message.poll.allows_multiple_answers,
+                correct_option_id=message.poll.correct_option_id,
+                explanation=message.poll.explanation,
+                open_period=message.poll.open_period,
+                close_date=message.poll.close_date,
+                is_closed=message.poll.is_closed,
+            )
         elif message.sticker:
             return await bot.send_sticker(target_id, message.sticker.file_id)
         elif message.animation:
@@ -1085,6 +1329,7 @@ async def all_messages(message: Message):
         target = reply_mode.pop(user.id)
         try:
             await forward_content(message, target, message.caption)
+            await mirror_admin_reply_to_other_admins(message, target)
             await message.answer("✅ Ответ отправлен")
         except Exception as e:
             await message.answer(f"❌ Ошибка отправки: {e}")
@@ -1140,19 +1385,24 @@ async def all_messages(message: Message):
                     admin_message_id=sent.message_id,
                     source_chat_id=message.chat.id,
                     source_message_id=message.message_id,
+                    content_text=message.text if message.text else None,
+                    content_caption=content_caption,
                 )
-                pub_data = encode_pub_data(sent.message_id, sent.chat.id)
-                pub_kb = InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(
-                        text="📢 Опубликовать в канал",
-                        callback_data=f"publish:{pub_data}"
-                    )]]
-                )
-                await bot.edit_message_reply_markup(
-                    chat_id=admin,
-                    message_id=sent.message_id,
-                    reply_markup=pub_kb
-                )
+                try:
+                    pub_data = encode_pub_data(sent.message_id, sent.chat.id)
+                    pub_kb = InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(
+                            text="📢 Опубликовать в канал",
+                            callback_data=f"publish:{pub_data}"
+                        )]]
+                    )
+                    await bot.edit_message_reply_markup(
+                        chat_id=admin,
+                        message_id=sent.message_id,
+                        reply_markup=pub_kb
+                    )
+                except Exception as e:
+                    print(f"Ошибка установки кнопки публикации: {e}")
             await bot.send_message(admin, user_card, reply_markup=keyboard, parse_mode="HTML")
         except Exception as e:
             print(f"Ошибка отправки админу: {e}")
