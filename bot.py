@@ -744,21 +744,8 @@ async def sync_admin_post_state(source_chat_id: int, source_message_id: int, sta
         except Exception as e:
             print(f"Ошибка sync_admin_post_state: {e}")
 
-    publication_state = "published" if allow_delete else "deleted"
-    for admin_chat_id, status_message_id in get_publication_statuses(source_chat_id, source_message_id):
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=admin_chat_id,
-                message_id=status_message_id,
-                reply_markup=build_admin_card_keyboard(
-                    user_id=source_chat_id,
-                    source_chat_id=source_chat_id,
-                    source_message_id=source_message_id,
-                    publication_state=publication_state,
-                )
-            )
-        except Exception as e:
-            print(f"Ошибка sync_admin_post_state(card): {e}")
+    # Карточка с данными пользователя больше не содержит кнопок публикации/удаления.
+    # Поэтому при смене статуса поста обновляем только само сообщение с контентом.
 # ================= KEYBOARDS =================
 
 def mute_time_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -821,24 +808,18 @@ def build_admin_card_keyboard(
     source_message_id: int,
     publication_state: str = "new",
 ) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(text="✉️ Ответить", callback_data=f"do_reply:{user_id}"),
-            InlineKeyboardButton(text="🚫 Бан",      callback_data=f"do_ban:{user_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="🔇 Мут",      callback_data=f"do_mute:{user_id}"),
-            InlineKeyboardButton(text="✅ Разбан",    callback_data=f"do_unban:{user_id}"),
-        ],
-    ]
-
-    data = encode_pub_data(source_message_id, source_chat_id)
-    if publication_state == "new":
-        rows.append([InlineKeyboardButton(text="📢 Опубликовать в канал", callback_data=f"publish:{data}")])
-    elif publication_state == "published":
-        rows.append([InlineKeyboardButton(text="🗑 Удалить из канала", callback_data=f"delpost:{data}")])
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✉️ Ответить", callback_data=f"do_reply:{user_id}"),
+                InlineKeyboardButton(text="🚫 Бан",      callback_data=f"do_ban:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🔇 Мут",      callback_data=f"do_mute:{user_id}"),
+                InlineKeyboardButton(text="✅ Разбан",    callback_data=f"do_unban:{user_id}"),
+            ],
+        ]
+    )
 
 
 def admin_main_keyboard():
@@ -1082,6 +1063,9 @@ async def publish_confirm(callback: types.CallbackQuery):
             mark_publication_done(source_chat_id, source_message_id, first_channel_message_id)
             set_media_group_channel_ids(source_chat_id, source_message_id, channel_message_ids)
         else:
+            # Для одиночных сообщений публикуем уже админскую копию контента.
+            # Это надёжнее для сообщений со ссылками/превью и не затрагивает карточку с данными,
+            # потому что кнопка публикации висит только на самом контенте.
             sent_to_channel = await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=chat_id, message_id=msg_id)
             mark_publication_done(source_chat_id, source_message_id, sent_to_channel.message_id)
 
@@ -1463,14 +1447,47 @@ async def cmd_unmute(message: Message):
 
 async def forward_content(message: Message, target_id: int, caption: str = None):
     try:
-        return await bot.copy_message(
-            chat_id=target_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id
-        )
+        if message.text:
+            return await bot.send_message(target_id, message.text)
+        elif message.photo:
+            return await bot.send_photo(target_id, message.photo[-1].file_id, caption=message.caption)
+        elif message.video:
+            return await bot.send_video(target_id, message.video.file_id, caption=message.caption)
+        elif message.audio:
+            return await bot.send_audio(target_id, message.audio.file_id, caption=message.caption)
+        elif message.document:
+            return await bot.send_document(target_id, message.document.file_id, caption=message.caption)
+        elif message.voice:
+            return await bot.send_voice(target_id, message.voice.file_id, caption=message.caption)
+        elif message.video_note:
+            return await bot.send_video_note(target_id, message.video_note.file_id)
+        elif message.sticker:
+            return await bot.send_sticker(target_id, message.sticker.file_id)
+        elif message.animation:
+            return await bot.send_animation(target_id, message.animation.file_id, caption=message.caption)
+        elif message.poll:
+            return await bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+        else:
+            return await bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
     except Exception as e:
-        print(f"Ошибка forward_content: {e}")
-        return None
+        print(f"Ошибка forward_content primary: {e}")
+        try:
+            return await bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+        except Exception as e2:
+            print(f"Ошибка forward_content fallback: {e2}")
+            return None
 
 
 async def process_user_media_group(messages: list[Message]):
@@ -1533,7 +1550,7 @@ async def process_user_media_group(messages: list[Message]):
                 content_caption=content_caption,
             )
             try:
-                pub_data = encode_pub_data(first_source_message_id, first_message.chat.id)
+                pub_data = encode_pub_data(first_sent.message_id, admin)
                 pub_kb = InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(
                         text="📢 Опубликовать в канал",
@@ -1546,7 +1563,8 @@ async def process_user_media_group(messages: list[Message]):
                     reply_markup=pub_kb
                 )
             except Exception as e:
-                print(f"Ошибка установки кнопки публикации альбома: {e}")
+                if "message is not modified" not in str(e).lower():
+                    print(f"Ошибка установки кнопки публикации альбома: {e}")
 
         try:
             card_message = await bot.send_message(
@@ -1686,7 +1704,7 @@ async def all_messages(message: Message):
                 content_caption=content_caption,
             )
             try:
-                pub_data = encode_pub_data(message.message_id, message.chat.id)
+                pub_data = encode_pub_data(sent.message_id, admin)
                 pub_kb = InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(
                         text="📢 Опубликовать в канал",
@@ -1699,7 +1717,8 @@ async def all_messages(message: Message):
                     reply_markup=pub_kb
                 )
             except Exception as e:
-                print(f"Ошибка установки кнопки публикации: {e}")
+                if "message is not modified" not in str(e).lower():
+                    print(f"Ошибка установки кнопки публикации: {e}")
 
         try:
             card_message = await bot.send_message(
