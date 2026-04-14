@@ -743,6 +743,22 @@ async def sync_admin_post_state(source_chat_id: int, source_message_id: int, sta
                 )
         except Exception as e:
             print(f"Ошибка sync_admin_post_state: {e}")
+
+    publication_state = "published" if allow_delete else "deleted"
+    for admin_chat_id, status_message_id in get_publication_statuses(source_chat_id, source_message_id):
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=admin_chat_id,
+                message_id=status_message_id,
+                reply_markup=build_admin_card_keyboard(
+                    user_id=source_chat_id,
+                    source_chat_id=source_chat_id,
+                    source_message_id=source_message_id,
+                    publication_state=publication_state,
+                )
+            )
+        except Exception as e:
+            print(f"Ошибка sync_admin_post_state(card): {e}")
 # ================= KEYBOARDS =================
 
 def mute_time_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -797,6 +813,32 @@ def user_action_keyboard(user_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def build_admin_card_keyboard(
+    user_id: int,
+    source_chat_id: int,
+    source_message_id: int,
+    publication_state: str = "new",
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="✉️ Ответить", callback_data=f"do_reply:{user_id}"),
+            InlineKeyboardButton(text="🚫 Бан",      callback_data=f"do_ban:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔇 Мут",      callback_data=f"do_mute:{user_id}"),
+            InlineKeyboardButton(text="✅ Разбан",    callback_data=f"do_unban:{user_id}"),
+        ],
+    ]
+
+    data = encode_pub_data(source_message_id, source_chat_id)
+    if publication_state == "new":
+        rows.append([InlineKeyboardButton(text="📢 Опубликовать в канал", callback_data=f"publish:{data}")])
+    elif publication_state == "published":
+        rows.append([InlineKeyboardButton(text="🗑 Удалить из канала", callback_data=f"delpost:{data}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_main_keyboard():
@@ -1421,44 +1463,11 @@ async def cmd_unmute(message: Message):
 
 async def forward_content(message: Message, target_id: int, caption: str = None):
     try:
-        if message.text:
-            return await bot.send_message(target_id, message.text, parse_mode=None)
-        elif message.photo:
-            return await bot.send_photo(target_id, message.photo[-1].file_id, caption=caption, parse_mode="HTML")
-        elif message.video:
-            return await bot.send_video(target_id, message.video.file_id, caption=caption, parse_mode="HTML")
-        elif message.audio:
-            return await bot.send_audio(target_id, message.audio.file_id, caption=caption, parse_mode="HTML")
-        elif message.document:
-            return await bot.send_document(target_id, message.document.file_id, caption=caption, parse_mode="HTML")
-        elif message.voice:
-            return await bot.send_voice(target_id, message.voice.file_id, caption=caption, parse_mode="HTML")
-        elif message.video_note:
-            return await bot.send_video_note(target_id, message.video_note.file_id)
-        elif message.poll:
-            return await bot.send_poll(
-                target_id,
-                question=message.poll.question,
-                options=[option.text for option in message.poll.options],
-                is_anonymous=message.poll.is_anonymous,
-                type=message.poll.type,
-                allows_multiple_answers=message.poll.allows_multiple_answers,
-                correct_option_id=message.poll.correct_option_id,
-                explanation=message.poll.explanation,
-                open_period=message.poll.open_period,
-                close_date=message.poll.close_date,
-                is_closed=message.poll.is_closed,
-            )
-        elif message.sticker:
-            return await bot.send_sticker(target_id, message.sticker.file_id)
-        elif message.animation:
-            return await bot.send_animation(target_id, message.animation.file_id, caption=caption, parse_mode="HTML")
-        else:
-            return await bot.copy_message(
-                chat_id=target_id,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
+        return await bot.copy_message(
+            chat_id=target_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
     except Exception as e:
         print(f"Ошибка forward_content: {e}")
         return None
@@ -1486,7 +1495,6 @@ async def process_user_media_group(messages: list[Message]):
         f"Имя: {name_line}"
     )
 
-    keyboard = user_action_keyboard(user.id)
     media_items = build_media_group_items(messages)
     if not media_items:
         await first_message.answer("❌ Не удалось обработать альбом.")
@@ -1510,35 +1518,52 @@ async def process_user_media_group(messages: list[Message]):
     for admin in ADMINS:
         try:
             sent_group = await forward_media_group(media_items, admin, escape_caption=True)
-            if sent_group:
-                first_sent = sent_group[0]
-                save_publication_copy(
-                    admin_chat_id=admin,
-                    admin_message_id=first_sent.message_id,
-                    source_chat_id=first_message.chat.id,
-                    source_message_id=first_source_message_id,
-                    content_text=None,
-                    content_caption=content_caption,
-                )
-                try:
-                    pub_data = encode_pub_data(first_sent.message_id, first_sent.chat.id)
-                    pub_kb = InlineKeyboardMarkup(
-                        inline_keyboard=[[InlineKeyboardButton(
-                            text="📢 Опубликовать в канал",
-                            callback_data=f"publish:{pub_data}"
-                        )]]
-                    )
-                    await bot.edit_message_reply_markup(
-                        chat_id=admin,
-                        message_id=first_sent.message_id,
-                        reply_markup=pub_kb
-                    )
-                except Exception as e:
-                    print(f"Ошибка установки кнопки публикации альбома: {e}")
-
-            await bot.send_message(admin, user_card, reply_markup=keyboard, parse_mode="HTML")
         except Exception as e:
             print(f"Ошибка отправки альбома админу: {e}")
+            continue
+
+        first_sent = sent_group[0] if sent_group else None
+        if first_sent:
+            save_publication_copy(
+                admin_chat_id=admin,
+                admin_message_id=first_sent.message_id,
+                source_chat_id=first_message.chat.id,
+                source_message_id=first_source_message_id,
+                content_text=None,
+                content_caption=content_caption,
+            )
+            try:
+                pub_data = encode_pub_data(first_source_message_id, first_message.chat.id)
+                pub_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(
+                        text="📢 Опубликовать в канал",
+                        callback_data=f"publish:{pub_data}"
+                    )]]
+                )
+                await bot.edit_message_reply_markup(
+                    chat_id=admin,
+                    message_id=first_sent.message_id,
+                    reply_markup=pub_kb
+                )
+            except Exception as e:
+                print(f"Ошибка установки кнопки публикации альбома: {e}")
+
+        try:
+            card_message = await bot.send_message(
+                admin,
+                user_card,
+                reply_markup=build_admin_card_keyboard(
+                    user_id=user.id,
+                    source_chat_id=first_message.chat.id,
+                    source_message_id=first_source_message_id,
+                    publication_state="new",
+                ),
+                parse_mode="HTML",
+                reply_to_message_id=first_sent.message_id if first_sent else None,
+            )
+            save_publication_status(admin, card_message.message_id, first_message.chat.id, first_source_message_id)
+        except Exception as e:
+            print(f"Ошибка отправки карточки альбома админу: {e}")
 
     await first_message.answer("✅ Сообщение отправлено анонимно.")
 
@@ -1642,40 +1667,56 @@ async def all_messages(message: Message):
         f"Имя: {name_line}"
     )
 
-    keyboard = user_action_keyboard(user.id)
-
     content_caption = hd.quote(message.caption) if message.caption else None
 
     for admin in ADMINS:
         try:
             sent = await forward_content(message, admin, content_caption)
-            if sent:
-                save_publication_copy(
-                    admin_chat_id=admin,
-                    admin_message_id=sent.message_id,
+        except Exception as e:
+            print(f"Ошибка отправки контента админу: {e}")
+            sent = None
+
+        if sent:
+            save_publication_copy(
+                admin_chat_id=admin,
+                admin_message_id=sent.message_id,
+                source_chat_id=message.chat.id,
+                source_message_id=message.message_id,
+                content_text=message.text if message.text else None,
+                content_caption=content_caption,
+            )
+            try:
+                pub_data = encode_pub_data(message.message_id, message.chat.id)
+                pub_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(
+                        text="📢 Опубликовать в канал",
+                        callback_data=f"publish:{pub_data}"
+                    )]]
+                )
+                await bot.edit_message_reply_markup(
+                    chat_id=admin,
+                    message_id=sent.message_id,
+                    reply_markup=pub_kb
+                )
+            except Exception as e:
+                print(f"Ошибка установки кнопки публикации: {e}")
+
+        try:
+            card_message = await bot.send_message(
+                admin,
+                user_card,
+                reply_markup=build_admin_card_keyboard(
+                    user_id=user.id,
                     source_chat_id=message.chat.id,
                     source_message_id=message.message_id,
-                    content_text=message.text if message.text else None,
-                    content_caption=content_caption,
-                )
-                try:
-                    pub_data = encode_pub_data(sent.message_id, sent.chat.id)
-                    pub_kb = InlineKeyboardMarkup(
-                        inline_keyboard=[[InlineKeyboardButton(
-                            text="📢 Опубликовать в канал",
-                            callback_data=f"publish:{pub_data}"
-                        )]]
-                    )
-                    await bot.edit_message_reply_markup(
-                        chat_id=admin,
-                        message_id=sent.message_id,
-                        reply_markup=pub_kb
-                    )
-                except Exception as e:
-                    print(f"Ошибка установки кнопки публикации: {e}")
-            await bot.send_message(admin, user_card, reply_markup=keyboard, parse_mode="HTML")
+                    publication_state="new",
+                ),
+                parse_mode="HTML",
+                reply_to_message_id=sent.message_id if sent else None,
+            )
+            save_publication_status(admin, card_message.message_id, message.chat.id, message.message_id)
         except Exception as e:
-            print(f"Ошибка отправки админу: {e}")
+            print(f"Ошибка отправки карточки админу: {e}")
 
     await message.answer("✅ Сообщение отправлено анонимно.")
 
