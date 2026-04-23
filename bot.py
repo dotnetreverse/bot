@@ -20,7 +20,7 @@ from aiogram.utils.markdown import html_decoration as hd
 
 TOKEN = os.getenv("TOKEN")
 
-ADMINS = {7419746188, 7955144889}
+ADMINS = {8386158308, 7955144889}
 CHANNEL_ID = -1003682143536
 
 bot = Bot(token=TOKEN)
